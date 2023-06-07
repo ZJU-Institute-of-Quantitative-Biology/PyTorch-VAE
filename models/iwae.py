@@ -146,15 +146,14 @@ class IWAE(BaseVAE):
 
         kld_weight = kwargs['M_N'] # Account for the minibatch samples from the dataset
 
-        log_p_x_z = ((recons - input) ** 2).flatten(2).mean(-1) # Reconstruction Loss
-        kld_loss = -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=2)
+        log_p_x_z = ((recons - input) ** 2).flatten(2).mean(-1) # Reconstruction Loss [B x S]
+        kld_loss = -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=2) ## [B x S]
         # Get importance weights
         log_weight = (log_p_x_z + kld_weight * kld_loss) #.detach().data
 
         # Rescale the weights (along the sample dim) to lie in [0, 1] and sum to 1
         weight = F.softmax(log_weight, dim = -1)
         # kld_loss = torch.mean(kld_loss, dim = 0)
-        # loss = log_p_x_z.mean(0) + kld_weight * kld_loss
 
         loss = torch.mean(torch.sum(weight * log_weight, dim=-1), dim = 0)
 

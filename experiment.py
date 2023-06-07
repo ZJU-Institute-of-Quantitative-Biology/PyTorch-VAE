@@ -1,14 +1,15 @@
+import os
 import math
 import torch
 from torch import optim
 from models import BaseVAE
 from models.types_ import *
+from utils import data_loader
 import pytorch_lightning as pl
 from torchvision import transforms
 import torchvision.utils as vutils
 from torchvision.datasets import CelebA
 from torch.utils.data import DataLoader
-
 
 
 class VAEXperiment(pl.LightningModule):
@@ -35,25 +36,14 @@ class VAEXperiment(pl.LightningModule):
         self.curr_device = real_img.device
 
         results = self.forward(real_img, labels = labels)
-
-        real_img2 = None
-        try:
-            # Required for factor VAE
-            if self.params['require_secondary_input']:
-                real_img2,_ = next(iter(self.sample_dataloader))
-                real_img2 = real_img.to(self.curr_device)
-        except:
-            pass
-
         train_loss = self.model.loss_function(*results,
-                                              M_N = self.params['batch_size']/ self.num_train_imgs,
+                                              M_N = self.params['kld_weight'], #al_img.shape[0]/ self.num_train_imgs,
                                               optimizer_idx=optimizer_idx,
-                                              secondary_input = real_img2,
                                               batch_idx = batch_idx)
 
-        self.logger.experiment.log({key: val.item() for key, val in train_loss.items()})
+        self.log_dict({key: val.item() for key, val in train_loss.items()}, sync_dist=True)
 
-        return train_loss
+        return train_loss['loss']
 
     def validation_step(self, batch, batch_idx, optimizer_idx = 0):
         real_img, labels = batch
@@ -61,53 +51,43 @@ class VAEXperiment(pl.LightningModule):
 
         results = self.forward(real_img, labels = labels)
         val_loss = self.model.loss_function(*results,
-                                            M_N = self.params['batch_size']/ self.num_train_imgs,
+                                            M_N = 1.0, #real_img.shape[0]/ self.num_val_imgs,
                                             optimizer_idx = optimizer_idx,
                                             batch_idx = batch_idx)
 
-        return val_loss
+        self.log_dict({f"val_{key}": val.item() for key, val in val_loss.items()}, sync_dist=True)
 
-    def validation_end(self, outputs):
-        avg_loss = torch.stack([x['loss'] for x in outputs]).mean()
-        tensorboard_logs = {'avg_val_loss': avg_loss}
+        
+    def on_validation_end(self) -> None:
         self.sample_images()
-        return {'val_loss': avg_loss, 'log': tensorboard_logs}
-
+        
     def sample_images(self):
-        # Get sample reconstruction image
-        test_input, test_label = next(iter(self.sample_dataloader))
+        # Get sample reconstruction image            
+        test_input, test_label = next(iter(self.trainer.datamodule.test_dataloader()))
         test_input = test_input.to(self.curr_device)
         test_label = test_label.to(self.curr_device)
+
+#         test_input, test_label = batch
         recons = self.model.generate(test_input, labels = test_label)
         vutils.save_image(recons.data,
-                          f"{self.logger.save_dir}{self.logger.name}/version_{self.logger.version}/"
-                          f"recons_{self.logger.name}_{self.current_epoch}.png",
+                          os.path.join(self.logger.log_dir , 
+                                       "Reconstructions", 
+                                       f"recons_{self.logger.name}_Epoch_{self.current_epoch}.png"),
                           normalize=True,
-                          nrow=int(math.sqrt(self.params['batch_size'])))
+                          nrow=12)
 
-        vutils.save_image(test_input.data,
-                          f"{self.logger.save_dir}{self.logger.name}/version_{self.logger.version}/"
-                          f"real_img_{self.logger.name}_{self.current_epoch}.png",
-                          normalize=True,
-                          nrow=int(math.sqrt(self.params['batch_size'])))
-
-        samples = self.model.sample(self.params['batch_size'],
-                                    self.curr_device,
-                                    labels = test_label).cpu()
-        vutils.save_image(samples.data,
-                          f"{self.logger.save_dir}{self.logger.name}/version_{self.logger.version}/"
-                          f"{self.logger.name}_{self.current_epoch}.png",
-                          normalize=True,
-                          nrow=int(math.sqrt(self.params['batch_size'])))
-
-
-        del test_input, recons, samples
-
-    def backward(self, use_amp, loss, optimizer, optimizer_idx):
-        if self.hold_graph and optimizer_idx == 0:
-            loss.backward(retain_graph = True)
-        else:
-            loss.backward(retain_graph = False)
+        try:
+            samples = self.model.sample(144,
+                                        self.curr_device,
+                                        labels = test_label)
+            vutils.save_image(samples.cpu().data,
+                              os.path.join(self.logger.log_dir , 
+                                           "Samples",      
+                                           f"{self.logger.name}_Epoch_{self.current_epoch}.png"),
+                              normalize=True,
+                              nrow=12)
+        except Warning:
+            pass
 
     def configure_optimizers(self):
 
@@ -144,52 +124,3 @@ class VAEXperiment(pl.LightningModule):
                 return optims, scheds
         except:
             return optims
-
-    @pl.data_loader
-    def train_dataloader(self):
-        transform = self.data_transforms()
-
-        if self.params['dataset'] == 'celeba':
-            dataset = CelebA(root = self.params['data_path'],
-                             split = "train",
-                             transform=transform,
-                             download=False)
-        else:
-            raise ValueError('Undefined dataset type')
-
-        self.num_train_imgs = len(dataset)
-        return DataLoader(dataset,
-                          batch_size= self.params['batch_size'],
-                          shuffle = True,
-                          drop_last=True)
-
-    @pl.data_loader
-    def val_dataloader(self):
-        transform = self.data_transforms()
-
-        if self.params['dataset'] == 'celeba':
-            self.sample_dataloader =  DataLoader(CelebA(root = self.params['data_path'],
-                                                        split = "test",
-                                                        transform=transform,
-                                                        download=False),
-                                                 batch_size= self.params['batch_size'],
-                                                 shuffle = True,
-                                                 drop_last=True)
-        else:
-            raise ValueError('Undefined dataset type')
-        return self.sample_dataloader
-
-    def data_transforms(self):
-
-        SetRange = transforms.Lambda(lambda X: 2 * X - 1.)
-
-        if self.params['dataset'] == 'celeba':
-            transform = transforms.Compose([transforms.RandomHorizontalFlip(),
-                                            transforms.CenterCrop(148),
-                                            transforms.Resize(self.params['img_size']),
-                                            transforms.ToTensor(),
-                                            SetRange])
-        else:
-            raise ValueError('Undefined dataset type')
-        return transform
-
